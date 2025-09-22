@@ -1,0 +1,15 @@
+Supplementary Data 3 – MCAS Processed Data
+
+Files:
+- integrated_matrix.csv : Concatenated PCA components per omics layer (meta_PC*, metabo_PC*, epi_PC*), one row per SampleID.
+- labels.csv            : Binary target for model training (Class: 0=healthy/younger, 1=vascular-aged).
+
+Notes:
+- This dataset was derived from Yatsunenko et al. (2012), Nature, 486(7402), 222–227 (https://doi.org/10.1038/nature11053).
+- Publicly available data from MG-RAST were used: qiime:850 (16S) and qiime:621 (shotgun).
+- The column format expected by MCAS_scripts.txt has been preserved: SampleID + 6 features (2 PCA components per omics layer).
+- The feature space can be extended by adding more PCA components if desired.
+
+Provenance:
+- Source data: Yatsunenko et al. (2012), MG-RAST open-access datasets.
+- This file represents processed outputs generated within the MCAS pipeline.
