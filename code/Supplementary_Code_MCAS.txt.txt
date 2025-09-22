@@ -1,0 +1,55 @@
+# MCAS - Microbial Cardiovascular Aging Model
+# Example pipeline for multi-omic integration and vascular aging prediction
+# Author: Erkan Özbay Biophysics Lab
+# License: MIT
+
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+
+# Step 1: Load example datasets
+metagenome = pd.read_csv("data/metagenome_example.csv")
+metabolome = pd.read_csv("data/metabolome_example.csv")
+epigenome  = pd.read_csv("data/epigenome_example.csv")
+
+# Step 2: Preprocess and normalize
+scaler = StandardScaler()
+meta_scaled = scaler.fit_transform(metagenome.drop("SampleID", axis=1))
+metabo_scaled = scaler.fit_transform(metabolome.drop("SampleID", axis=1))
+epi_scaled = scaler.fit_transform(epigenome.drop("SampleID", axis=1))
+
+# Step 3: Dimensionality reduction
+pca = PCA(n_components=2)
+meta_pca = pca.fit_transform(meta_scaled)
+metabo_pca = pca.fit_transform(metabo_scaled)
+epi_pca = pca.fit_transform(epi_scaled)
+
+# Step 4: Integrative dataset (concatenation)
+integrated = np.concatenate([meta_pca, metabo_pca, epi_pca], axis=1)
+
+# Step 5: Predictive modeling
+labels = pd.read_csv("data/labels.csv")  # vascular aging phenotype (0=healthy, 1=aged)
+clf = LogisticRegression()
+clf.fit(integrated, labels["Class"])
+print("Model accuracy (training set):", clf.score(integrated, labels["Class"]))
+
+# Step 6: Simple network visualization
+G = nx.Graph()
+for metabolite in metabolome.columns[1:5]:
+    G.add_node(metabolite, type="metabolite")
+for gene in epigenome.columns[1:5]:
+    G.add_node(gene, type="epigenetic")
+for taxon in metagenome.columns[1:5]:
+    G.add_node(taxon, type="microbial")
+
+# Add example edges
+edges = [(metabolome.columns[1], epigenome.columns[1]),
+         (epigenome.columns[2], metagenome.columns[2])]
+G.add_edges_from(edges)
+
+nx.draw(G, with_labels=True, node_size=500, node_color="lightblue")
+plt.show()
