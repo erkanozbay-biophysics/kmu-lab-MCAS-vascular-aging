@@ -1,0 +1,415 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Supplementary_Code_MCAS
+MCAS: Microbial Cardiovascular Aging Signature (MCAS) — predictive modeling with nested cross-validation,
+metrics (ROC-AUC, PR-AUC, Brier), calibration, and ablation.
+
+Required inputs (repository-provided, processed features):
+- data/integrated_matrix.csv : SampleID + 6 numeric features (2 PCs per layer)
+- data/labels.csv            : SampleID, Class  (0=healthy/younger, 1=vascular-aged)
+
+Expected feature naming in integrated_matrix.csv (explicit; required for ablation):
+- meta_PC1, meta_PC2
+- metabo_PC1, metabo_PC2
+- epi_PC1, epi_PC2
+
+Modeling and evaluation:
+- Nested cross-validation: outer=5, inner=3
+- Classifier: L2-regularized logistic regression with class_weight="balanced"
+- Metrics: ROC-AUC, PR-AUC, Brier score
+- AUC 95% CI via non-parametric bootstrapping with B=500 resamples
+
+Outputs:
+- results/Supplementary Data 4.json  : summary metrics
+- results/Supplementary Data 5.json  : ablation metrics
+- figures/Supplementary Figure S1.png : ROC (outer predictions)
+- figures/Supplementary Figure S2.png : Calibration (outer predictions; 10 equal-frequency bins)
+- figures/Supplementary Figure S3.png : Ablation barplot (mean AUC)
+"""
+
+import os
+import json
+import math
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec  # avoids pyplot.GridSpec compatibility issues
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss, roc_curve
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+# -------------------------
+# Configuration
+# -------------------------
+RANDOM_STATE = 42
+OUTER_FOLDS = 5
+INNER_FOLDS = 3
+BOOTSTRAP_N = 500
+N_BINS_CAL = 10
+
+X_PATH = "data/integrated_matrix.csv"
+Y_PATH = "data/labels.csv"
+
+OUT_DIR_RES = "results"
+OUT_DIR_FIG = "figures"
+os.makedirs(OUT_DIR_RES, exist_ok=True)
+os.makedirs(OUT_DIR_FIG, exist_ok=True)
+
+GROUPS = {
+    "M": ["meta_PC1", "meta_PC2"],
+    "K": ["metabo_PC1", "metabo_PC2"],
+    "E": ["epi_PC1", "epi_PC2"],
+}
+
+
+# -------------------------
+# I/O and alignment
+# -------------------------
+def load_integrated_matrix(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing input file: {path}")
+    df = pd.read_csv(path)
+    if "SampleID" not in df.columns:
+        raise ValueError(f"Missing 'SampleID' column in {path}.")
+    return df
+
+
+def load_labels(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing input file: {path}")
+    df = pd.read_csv(path)
+    if not {"SampleID", "Class"} <= set(df.columns):
+        raise ValueError("labels.csv must contain 'SampleID' and 'Class' columns.")
+    return df
+
+
+def align_on_sampleid(X: pd.DataFrame, y: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    Xc = X.copy()
+    yc = y.copy()
+    Xc["SampleID"] = Xc["SampleID"].astype(str)
+    yc["SampleID"] = yc["SampleID"].astype(str)
+
+    common = sorted(list(set(Xc["SampleID"]).intersection(set(yc["SampleID"]))))
+    if len(common) == 0:
+        raise ValueError("No overlapping SampleID values between integrated_matrix and labels.")
+
+    Xc = Xc[Xc["SampleID"].isin(common)].sort_values("SampleID").reset_index(drop=True)
+    yc = yc[yc["SampleID"].isin(common)].sort_values("SampleID").reset_index(drop=True)
+
+    if not np.all(Xc["SampleID"].values == yc["SampleID"].values):
+        raise ValueError("SampleID alignment mismatch after sorting.")
+
+    y_series = yc["Class"].astype(int)
+    return Xc, y_series
+
+
+def require_group_columns(X: pd.DataFrame, groups: Dict[str, List[str]]) -> None:
+    missing: List[str] = []
+    for cols in groups.values():
+        for c in cols:
+            if c not in X.columns:
+                missing.append(c)
+    if missing:
+        raise ValueError(
+            "integrated_matrix.csv is missing required columns for ablation: " + ", ".join(missing)
+        )
+
+
+# -------------------------
+# Metrics utilities
+# -------------------------
+def bootstrap_auc_ci(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    n_boot: int = BOOTSTRAP_N,
+    seed: int = RANDOM_STATE,
+    alpha: float = 0.95,
+) -> Tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    aucs: List[float] = []
+    n = len(y_true)
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        try:
+            aucs.append(float(roc_auc_score(y_true[idx], y_score[idx])))
+        except ValueError:
+            continue
+
+    if len(aucs) == 0:
+        raise ValueError("Bootstrap AUC CI failed: no valid resamples.")
+
+    lo = float(np.percentile(aucs, (1 - alpha) / 2 * 100))
+    hi = float(np.percentile(aucs, (1 + alpha) / 2 * 100))
+    return lo, hi
+
+
+def calibration_bins_equal_frequency(
+    y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = N_BINS_CAL
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    qs = np.quantile(y_prob, np.linspace(0, 1, n_bins + 1))
+    qs[0], qs[-1] = 0.0, 1.0
+
+    bin_means_pred, bin_obs, counts = [], [], []
+    for i in range(n_bins):
+        left, right = qs[i], qs[i + 1]
+        if i == n_bins - 1:
+            mask = (y_prob >= left) & (y_prob <= right)
+        else:
+            mask = (y_prob >= left) & (y_prob < right)
+
+        if mask.sum() == 0:
+            continue
+
+        bin_means_pred.append(float(y_prob[mask].mean()))
+        bin_obs.append(float(y_true[mask].mean()))
+        counts.append(int(mask.sum()))
+
+    return np.array(bin_means_pred), np.array(bin_obs), np.array(counts)
+
+
+def wilson_ci(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+    if n == 0:
+        return 0.0, 0.0
+    p = k / n
+    denom = 1 + (z**2) / n
+    center = (p + (z**2) / (2 * n)) / denom
+    half = (z * math.sqrt((p * (1 - p) + (z**2) / (4 * n)) / n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+# -------------------------
+# Modeling (nested CV)
+# -------------------------
+def build_model_pipeline() -> Pipeline:
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    clf = LogisticRegression(
+        penalty="l2",
+        solver="liblinear",
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+        max_iter=500,
+    )
+    return Pipeline(steps=[("scaler", scaler), ("clf", clf)])
+
+
+def run_nested_cv(X: pd.DataFrame, y: np.ndarray) -> Dict[str, object]:
+    skf_outer = StratifiedKFold(n_splits=OUTER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+    aucs, prs, briers = [], [], []
+    y_true_all, y_prob_all = [], []
+
+    for tr_idx, te_idx in skf_outer.split(X, y):
+        X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        pipe = build_model_pipeline()
+        param_grid = {"clf__C": [0.1, 0.5, 1.0, 2.0, 5.0]}
+        skf_inner = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+        gs = GridSearchCV(
+            estimator=pipe,
+            param_grid=param_grid,
+            scoring="roc_auc",
+            cv=skf_inner,
+            n_jobs=-1,
+            refit=True,
+        )
+        gs.fit(X_tr, y_tr)
+
+        prob = gs.predict_proba(X_te)[:, 1]
+
+        aucs.append(float(roc_auc_score(y_te, prob)))
+        prs.append(float(average_precision_score(y_te, prob)))
+        briers.append(float(brier_score_loss(y_te, prob)))
+
+        y_true_all.append(y_te)
+        y_prob_all.append(prob)
+
+    y_true_all_arr = np.concatenate(y_true_all)
+    y_prob_all_arr = np.concatenate(y_prob_all)
+
+    return {
+        "AUC_mean_outer": float(np.mean(aucs)),
+        "PR_AUC_mean_outer": float(np.mean(prs)),
+        "Brier_mean_outer": float(np.mean(briers)),
+        "AUC_CI95": bootstrap_auc_ci(y_true_all_arr, y_prob_all_arr, n_boot=BOOTSTRAP_N),
+        "y_true_outer": y_true_all_arr,
+        "y_prob_outer": y_prob_all_arr,
+    }
+
+
+# -------------------------
+# Plots
+# -------------------------
+def plot_roc(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    auc_val: float,
+    ci: Tuple[float, float],
+    out_path: str,
+) -> None:
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, lw=2, label=f"AUC = {auc_val:.3f} (95% CI: {ci[0]:.3f}–{ci[1]:.3f})")
+    plt.plot([0, 1], [0, 1], "--", label="Random guess")
+    plt.xlim(0, 1)
+    plt.ylim(0, 1.02)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC (Nested CV, outer predictions)")
+    plt.legend(loc="lower right")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+
+def plot_calibration(y_true: np.ndarray, y_prob: np.ndarray, brier: float, out_path: str) -> None:
+    x, y_obs, counts = calibration_bins_equal_frequency(y_true, y_prob, n_bins=N_BINS_CAL)
+
+    lows, highs = [], []
+    for obs, n in zip(y_obs, counts):
+        lo, hi = wilson_ci(int(round(obs * n)), int(n))
+        lows.append(lo)
+        highs.append(hi)
+
+    plt.figure(figsize=(6.4, 8))
+    gs = GridSpec(2, 1, height_ratios=[3, 1], hspace=0.35)
+
+    ax1 = plt.subplot(gs[0])
+    ax1.plot([0, 1], [0, 1], "--", label="Perfect calibration")
+    ax1.errorbar(
+        x,
+        y_obs,
+        yerr=[y_obs - np.array(lows), np.array(highs) - y_obs],
+        fmt="o-",
+        ecolor="gray",
+        capsize=3,
+        label="Observed (95% CI)",
+    )
+    ax1.set_title("Calibration (Nested CV, outer predictions)")
+    ax1.set_xlabel("Predicted probability")
+    ax1.set_ylabel("Observed frequency")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.legend(loc="upper left")
+
+    ax2 = plt.subplot(gs[1])
+    ax2.hist(y_prob, bins=np.linspace(0, 1, N_BINS_CAL + 1), alpha=0.75, edgecolor="black")
+    ax2.set_xlabel("Predicted probability")
+    ax2.set_ylabel("Count")
+    ax2.set_title("Distribution of predicted probabilities")
+
+    plt.gcf().text(
+        0.5,
+        -0.02,
+        f"(n={len(y_true)}; {N_BINS_CAL} equal-frequency bins)  Mean Brier score = {brier:.3f}",
+        ha="center",
+        va="top",
+        fontsize=9,
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_ablation_bar(ablation_dict: Dict[str, Dict[str, float]], out_path: str) -> None:
+    order = ["M_only", "K_only", "E_only", "MK", "ME", "KE", "MKE_full"]
+    for k in order:
+        if k not in ablation_dict:
+            raise KeyError(f"Missing ablation key: {k}")
+
+    vals = [float(ablation_dict[k]["AUC"]) for k in order]
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(range(len(order)), vals)
+    plt.xticks(range(len(order)), order, rotation=35)
+    plt.ylabel("Mean AUC (Nested CV)")
+    plt.title("Ablation: modality subsets")
+    plt.ylim(0, 1.0)
+    plt.grid(axis="y", alpha=0.2, linestyle="--")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+
+# -------------------------
+# Main
+# -------------------------
+if __name__ == "__main__":
+    X_raw = load_integrated_matrix(X_PATH)
+    y_raw = load_labels(Y_PATH)
+
+    require_group_columns(X_raw, GROUPS)
+    X_aligned, y_series = align_on_sampleid(X_raw, y_raw)
+
+    X_M = X_aligned[GROUPS["M"]]
+    X_K = X_aligned[GROUPS["K"]]
+    X_E = X_aligned[GROUPS["E"]]
+    X_MK = X_aligned[GROUPS["M"] + GROUPS["K"]]
+    X_ME = X_aligned[GROUPS["M"] + GROUPS["E"]]
+    X_KE = X_aligned[GROUPS["K"] + GROUPS["E"]]
+    X_MKE = X_aligned[GROUPS["M"] + GROUPS["K"] + GROUPS["E"]]
+
+    y = y_series.to_numpy()
+
+    main = run_nested_cv(X_MKE, y)
+
+    plot_roc(
+        main["y_true_outer"],
+        main["y_prob_outer"],
+        main["AUC_mean_outer"],
+        main["AUC_CI95"],
+        os.path.join(OUT_DIR_FIG, "Supplementary Figure S1.png"),
+    )
+    plot_calibration(
+        main["y_true_outer"],
+        main["y_prob_outer"],
+        main["Brier_mean_outer"],
+        os.path.join(OUT_DIR_FIG, "Supplementary Figure S2.png"),
+    )
+
+    configs = {
+        "M_only": X_M,
+        "K_only": X_K,
+        "E_only": X_E,
+        "MK": X_MK,
+        "ME": X_ME,
+        "KE": X_KE,
+        "MKE_full": X_MKE,
+    }
+
+    ablation: Dict[str, Dict[str, float]] = {}
+    for name, X_cfg in configs.items():
+        out = run_nested_cv(X_cfg, y)
+        ablation[name] = {
+            "AUC": float(out["AUC_mean_outer"]),
+            "PR_AUC": float(out["PR_AUC_mean_outer"]),
+            "Brier": float(out["Brier_mean_outer"]),
+        }
+
+    plot_ablation_bar(ablation, os.path.join(OUT_DIR_FIG, "Supplementary Figure S3.png"))
+
+    supp4 = {
+        "n_samples": int(len(y)),
+        "n_features": int(X_MKE.shape[1]),
+        "outer_folds": int(OUTER_FOLDS),
+        "inner_folds": int(INNER_FOLDS),
+        "auc_mean_outer": float(main["AUC_mean_outer"]),
+        "auc_ci95": [float(main["AUC_CI95"][0]), float(main["AUC_CI95"][1])],
+        "prauc_mean_outer": float(main["PR_AUC_mean_outer"]),
+        "brier_mean_outer": float(main["Brier_mean_outer"]),
+    }
+
+    with open(os.path.join(OUT_DIR_RES, "Supplementary Data 4.json"), "w", encoding="utf-8") as f:
+        json.dump(supp4, f, indent=2)
+
+    with open(os.path.join(OUT_DIR_RES, "Supplementary Data 5.json"), "w", encoding="utf-8") as f:
+        json.dump(ablation, f, indent=2)

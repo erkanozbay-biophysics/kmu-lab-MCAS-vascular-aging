@@ -1,0 +1,13 @@
+{
+  "n_samples": 60,
+  "n_features": 6,
+  "outer_folds": 5,
+  "inner_folds": 3,
+  "auc_mean_outer": 0.8931746031746032,
+  "auc_ci95": [
+    0.7874307299714615,
+    0.9585286458333333
+  ],
+  "prauc_mean_outer": 0.9129024943310657,
+  "brier_mean_outer": 0.14675292221495467
+}
